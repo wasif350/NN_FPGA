@@ -1,36 +1,94 @@
-# FPGA-Accelerated Exact k-Nearest Neighbor Search
+# FPGA-Accelerated Exact Range Similarity Search (20D)
 
-This repository contains Vitis HLS and Vivado implementations for exact similarity search and distance calculations on multi-dimensional spatial datasets. The project utilizes hardware-software co-design to eliminate data movement bottlenecks by processing data directly on the hardware layer.
-
-The project began with a simple batching baseline to handle point transmission and distance calculation, and has since evolved to utilize dynamic grid indexing, custom dataflows, and parallel IP core execution.
-
-## ⚙️ Architecture & Hardware Parameters
-
-*   **Algorithm:** Grid Indexing (Indexed on 3 dimensions)
-*   **Maximum Dimensions:** 8
-*   **HLS Unroll Factor:** 4 (Applied to both data points and dimensional loops)
-*   **BRAM Storage (Targets/Data Points):** 5,000 (Scalable up to 7,168)
-*   **BRAM Storage (Query/Anchor Points):** 2,048
+Exact range-based similarity search on the Xilinx Alveo U280 FPGA.
+The host builds a dynamic K-dimensional grid index, prunes candidates, and send candidates to the FPGA kernel for exact distance computation.
 
 ---
 
-## 📁 Codebase Structure
+## Files
 
-The codebase is split into two primary methodologies: **Self-Join** implementations (comparing a dataset against itself) and **Dual Dataset** implementations (query vs. target).
+| File | Description |
+| :--- | :--- |
+| `baseline_kernel_20d.cpp` | Optimized kernel — UNROLL_FACTOR=15, URAM dataset caching, BRAM query caching|
+| `baseline_kernel_20d_basic_1.cpp` | Basic sequential kernel — no caching, no unrolling; reference implementation |
+| `index_fpga_dynamic.cpp` | Host driver — K-D grid index + OpenMP pruning + XRT dispatch to FPGA |
 
-### 1. Self-Join Implementations
+---
 
-| Project / Filename | Version | Core Features |
-| :--- | :--- | :--- |
-| `Ndim_ddr_anc_batch_app` | Grid Static Baseline | Static 3D grid construction strictly using the first three (X, Y, Z) dimensions. |
-| `Anchor_batch_opt_try_application` | Grid Dynamic Baseline | Indexing on the 3 highest-variance dimensions. Unindexed 4th dimension is sorted. |
-| `Anchor_batch_opt_64float_application`| Grid Dynamic V2 | Retains dynamic grid and 4th-dimension sorting. Explicitly enables integer division and multiplication optimizations in Vivado. |
+## Dataset Binary Format
 
-### 2. Query vs. Target Implementations
+Same format for both dataset and query files:
 
-These versions process two distinct datasets to support general similarity searches based on different application requirements.
+[4 bytes] int32 — num_dims
+[4 bytes] int32 — num_points
+[num_points × num_dims × 4 bytes] float32 — point data, row-major
 
-| Project / Filename | Version | Core Features |
-| :--- | :--- | :--- |
-| `Twodatasetproj_app` | Baseline | Computes distances between two completely separate datasets (Query vs. Target). |
-| `dual_ip_core_app` | Dual IP Cores | Instantiates two identical copies of the kernel to process data concurrently. Features an unroll factor of 2, 6 max dimensions, two DMAs, and dual IPs in Vivado with parallel execution calls in Vitis IDE. |
+The SUSY 20D dataset was used for testing this specific kernel.
+Download the SUSY dataset from: https://archive.ics.uci.edu/dataset/279/susy
+Convert to binary format using `convert_susy.py` before running.
+---
+
+## Prerequisites
+
+- Xilinx XRT (Xilinx Runtime) installed — provides the `xrt/xrt_device.h`, `xrt/xrt_kernel.h`, and `xrt/xrt_bo.h` headers and runtime libraries required by the host driver.
+- Install XRT: https://github.com/Xilinx/XRT
+
+## Compile & Link (Xilinx U280)
+
+**1. Compile kernel**
+```bash
+v++ -t hw -c \
+    --platform xilinx_u280_gen3x16_xdma_1_202211_1 \
+    -k similarity_search \
+    -o similarity_search.xo \
+    baseline_kernel_20d.cpp
+```
+
+**2. Create link.cfg** (1 CU example)
+```ini
+[connectivity]
+nk=similarity_search:1:similarity_search_1
+```
+
+**3. Link to xclbin** (~8–12 hours)
+```bash
+v++ -t hw -l \
+    --platform xilinx_u280_gen3x16_xdma_1_202211_1 \
+    --config link.cfg \
+    -o similarity_search.xclbin \
+    similarity_search.xo
+```
+
+**4. Compile host**
+```bash
+g++ -O3 -std=c++17 -fopenmp \
+    -I/opt/xilinx/xrt/include \
+    -L/opt/xilinx/xrt/lib \
+    -o index_dynmaic_debug \
+    index_fpga_dynamic.cpp \
+    -lxrt_coreutil -lxrt_core
+```
+
+---
+
+## Run
+
+```bash
+./index_dynmaic_debug <xclbin> <dataset.bin> <queries.bin> <radius> <num_cus> <point_pad> <unroll_factor> [num_index_dims]
+```
+
+Example:
+```bash
+./index_dynmaic_debug similarity_search.xclbin higgs.bin higgs_queries.bin 0.037 1 20 15 3
+```
+
+- `point_pad` must match kernel POINT_PAD → use `20`
+- `unroll_factor` must match kernel UNROLL_FACTOR → use `15` (optimized) or `1` (basic)
+
+---
+
+## Porting to a Different FPGA
+
+Change the `--platform` string in both `v++` commands to your board's platform string.
+Find it with: `platforminfo --list`
+Full re-synthesis required for each new platform. Resource configurations (BRAM, URAM, DSP usage) depend on the available resources of the target FPGA.
